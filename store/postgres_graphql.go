@@ -9,6 +9,7 @@ import (
 	sq "github.com/Masterminds/squirrel"
 	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/language/kinds"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -94,6 +95,8 @@ func psqlResolveRootQuery(pool *pgxpool.Pool, tenant string, graph *SchemaGraph,
 		return nil, fmt.Errorf("error replacing the SQL (squirrel) placeholders: %w", err)
 	}
 
+	fmt.Println("SQL: " + sqlStr)
+
 	// Execute the query
 	rows, err := pool.Query(context.Background(), sqlStr, sqlArgs...)
 	if err != nil {
@@ -141,8 +144,10 @@ func psqlSubQuery(tenant string, graph *SchemaGraph, sql *sq.SelectBuilder, pare
 		nodeQuery = sq.Select().From(tableAsAlias(psqlAbsTableName(tenant, tc.table), tc.alias))
 		subFields = make([]*ast.Field, 0)
 
-		// In SQL terms, filterOn says whether to perform a LEFT or an INNER JOIN
-		filterOn bool
+		// In SQL terms, notNull says whether to perform a LEFT or an INNER JOIN
+		notNull bool
+		// filterIsNull contains a list of tables that we should filter for null on
+		filterIsNullArg *ast.Argument
 		// The `order_by` GraphQL argument can only be processed after all table aliases
 		// are known. That includes the tables referenced by the GraphQL subfields.
 		// Therefore, upon encountering the `order_by` argument in one of the root
@@ -192,13 +197,16 @@ func psqlSubQuery(tenant string, graph *SchemaGraph, sql *sq.SelectBuilder, pare
 
 		// Process the arguments that are not GraphQL/DB field/column names...
 		switch arg.Name.Value {
-		case filterOnID:
-			// The filterOnID argument is used on sub-fields and should be
+		case notNullID:
+			// The notNullID argument is used on sub-fields and should be
 			// processed by the parent. E.g.
 			// table_a {
-			// 	table_b(filter_on: true) {...}
+			// 	table_b(not_null: true) {...}
 			// }
-			filterOn = true
+			notNull = true
+			argIsResolved = true
+		case filterIsNullID:
+			filterIsNullArg = arg
 			argIsResolved = true
 		case orderByID:
 			// The order_by argument is allowed only at the top level. Futhermore, it cannot be processed until
@@ -316,6 +324,45 @@ func psqlSubQuery(tenant string, graph *SchemaGraph, sql *sq.SelectBuilder, pare
 			rhsJoinOn = tableColumn(leftTableAlias, foreignKeyField(rightTable))
 			// Make sure we select the foreign key field from the parent
 			nodeQuery = nodeQuery.Column(rhsJoinOn)
+		}
+	}
+
+	//
+	// Is Null
+	//
+	// If the filter_is_null argument is used, we need to filter on null for the
+	// tables provided
+	if filterIsNullArg != nil {
+		var filterIsNull []string
+		switch {
+		case filterIsNullArg.Value.GetKind() == kinds.EnumValue:
+			filterIsNull = append(filterIsNull, filterIsNullArg.Value.GetValue().(string))
+		case filterIsNullArg.Value.GetKind() == kinds.ListValue:
+			for _, arg := range filterIsNullArg.Value.GetValue().([]ast.Value) {
+				filterIsNull = append(filterIsNull, arg.GetValue().(string))
+			}
+		default:
+			return fmt.Errorf("unknown argument kind for argument %s: %s", filterIsNullID, filterIsNullArg.Value.GetKind())
+		}
+		// Goal: create a subquery that will filter the current node/table when
+		// the provided argument table is null.
+		// Nicest way was using a WHERE NOT EXISTS query, e.g.
+		// WHERE NOT EXISTS( SELECT 1 FROM abc WHERE abc.id = node.abc_id)
+		for _, nullTable := range filterIsNull {
+			e, err := node.Edge(nullTable)
+			if err != nil {
+				return fmt.Errorf("no edge found for filter_is_null argument on table %s: %s", node.Table.Name, nullTable)
+			}
+			subQueryFilter := sq.Select("1").From(psqlAbsTableName(tenant, nullTable))
+			// Depending on the edge direction (relationship) we know if the left table
+			// or right table has the foreign key
+			if e.Rel == BelongsTo {
+				subQueryFilter = subQueryFilter.Where(tableColumn(nullTable, tableIDField) + " = " + tableColumn(tc.alias, nullTable+tableJoinSuffix))
+			} else {
+				subQueryFilter = subQueryFilter.Where(tableColumn(nullTable, tc.table+tableJoinSuffix) + " = " + tableColumn(tc.alias, tableIDField))
+			}
+			sqStr, sqArgs := subQueryFilter.MustSql()
+			nodeQuery = nodeQuery.Where("NOT EXISTS( "+sqStr+" )", sqArgs...)
 		}
 	}
 
@@ -446,7 +493,7 @@ func psqlSubQuery(tenant string, graph *SchemaGraph, sql *sq.SelectBuilder, pare
 		sqlStr = " ( " + sqlStr + " ) AS " + rightTableAlias
 		joinStr = "LATERAL " + sqlStr + " ON true"
 
-		if filterOn {
+		if notNull {
 			*sql = sql.InnerJoin(joinStr, sqlArgs...)
 		} else {
 			*sql = sql.LeftJoin(joinStr, sqlArgs...)

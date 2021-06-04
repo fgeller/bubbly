@@ -80,6 +80,7 @@ func (n *natsClient) QueryType(bCtx *env.BubblyContext, auth *component.MessageA
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("error decoding GraphQL result: %w", err)
 	}
+	fmt.Printf("GRAAAAAAPHQL: %#v\n\n", result.Errors)
 	// TODO: make errors a bit nicer
 	if result.HasErrors() {
 		return fmt.Errorf("graphql returned errors: %v", result.Errors)
